@@ -10,7 +10,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 # Logs to check for errors and debug information
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-TOKEN = "8918095840:AAEHsVLYBxnrB0ETm7lsFTQv412_ca924Pc"
+TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 
 ACTIVITY = ["Palestra 🏋️", "Sviluppo C# 💻", "Streaming/Gaming 🎮"]
 ACTIVITY_FILE = "activity_cycle.json"
