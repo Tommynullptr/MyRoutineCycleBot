@@ -389,7 +389,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 def main() -> None:
-    """Configure the bot and use webhooks on Render or polling locally."""
+    """Configure the bot and start its webhook server."""
 
     initialize_database()
 
@@ -423,20 +423,17 @@ def main() -> None:
     app.add_handler(CommandHandler("next", next_activity))
     app.add_handler(MessageHandler(filters.Regex(r"^Show routine$"), show_routine))
     app.add_handler(MessageHandler(filters.Regex(r"^Next activity$"), next_activity))
-    if os.environ.get("RENDER") == "true":
-        render_url = os.environ["RENDER_EXTERNAL_URL"].rstrip("/")
-        webhook_secret = os.environ["WEBHOOK_SECRET"]
-        webhook_path = "telegram-webhook"
+    render_url = os.environ["RENDER_EXTERNAL_URL"].rstrip("/")
+    webhook_secret = os.environ["WEBHOOK_SECRET"]
+    webhook_path = "telegram-webhook"
 
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=int(os.environ.get("PORT", "10000")),
-            url_path=webhook_path,
-            webhook_url=f"{render_url}/{webhook_path}",
-            secret_token=webhook_secret,
-        )
-    else:
-        app.run_polling()
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=int(os.environ.get("PORT", "10000")),
+        url_path=webhook_path,
+        webhook_url=f"{render_url}/{webhook_path}",
+        secret_token=webhook_secret,
+    )
 
 
 if __name__ == "__main__":
