@@ -37,11 +37,16 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
 )
 
 
+def connect_database():
+    """Open a PostgreSQL connection with a bounded connection wait."""
+    return psycopg.connect(DATABASE_URL, connect_timeout=10)
+
+
 
 def initialize_database() -> None:
     """Create the database tables used to store user routines and activities."""
 
-    with psycopg.connect(DATABASE_URL) as connection:
+    with connect_database() as connection:
 
         connection.execute(
             """
@@ -67,7 +72,7 @@ def initialize_database() -> None:
 def get_routine(user_id: int) -> dict:
     """Load one user's routine and activities in their saved order."""
 
-    with psycopg.connect(DATABASE_URL) as connection:
+    with connect_database() as connection:
 
         row = connection.execute(
             "SELECT current_index FROM user_routines WHERE telegram_user_id = %s", (user_id,)
@@ -95,7 +100,7 @@ def save_routine(user_id: int, routine: dict) -> None:
     activities = routine["activities"]
     current_index = routine["current_index"] if activities else 0
 
-    with psycopg.connect(DATABASE_URL) as connection:
+    with connect_database() as connection:
 
         connection.execute(
             """
@@ -134,7 +139,8 @@ def format_routine(routine: dict) -> str:
 
     for index, activity in enumerate(activities):
         marker = "▶️" if index == routine["current_index"] else "▫️"
-        lines.append(f"{marker} {index + 1}. {activity['name']} — {activity['description']}")
+        description = f" — {activity['description']}" if activity["description"] else ""
+        lines.append(f"{marker} {index + 1}. {activity['name']}{description}")
 
     return "\n".join(lines)
 
@@ -183,38 +189,59 @@ async def receive_activity_name(update: Update, context: ContextTypes.DEFAULT_TY
         return ADD_NAME
     
     context.user_data["new_activity_name"] = name
-    await update.message.reply_text("Add a short description for this activity.")
+    await update.message.reply_text(
+        "Add a short description, or send /skip to leave it blank."
+    )
 
     return ADD_DESCRIPTION
 
-async def receive_activity_description(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Save the new activity after receiving its description."""
-
-    description = update.message.text.strip()
-
-    if not description:
-        await update.message.reply_text("The description cannot be empty. Please choose a description.")
-        return ADD_DESCRIPTION
-
+async def complete_add_activity(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, description: str
+) -> int:
+    """Save the pending activity, allowing an empty description."""
     user_id = update.effective_user.id
-    routine = get_routine(user_id)
-
-    if len(routine["activities"]) >= MAX_ACTIVITIES:
+    name = context.user_data.get("new_activity_name")
+    if not name:
         await update.message.reply_text(
-            f"Your routine already has {MAX_ACTIVITIES} activities. Delete one before adding another.",
+            "I couldn't find the activity name. Please start again with Add activity.",
             reply_markup=MAIN_KEYBOARD,
         )
-
         return ConversationHandler.END
-    
-    routine["activities"].append(
-        {"name": context.user_data.pop("new_activity_name"), "description": description}
-    )
 
-    save_routine(user_id, routine)
+    try:
+        routine = get_routine(user_id)
+        if len(routine["activities"]) >= MAX_ACTIVITIES:
+            context.user_data.pop("new_activity_name", None)
+            await update.message.reply_text(
+                f"Your routine already has {MAX_ACTIVITIES} activities. Delete one before adding another.",
+                reply_markup=MAIN_KEYBOARD,
+            )
+            return ConversationHandler.END
+
+        routine["activities"].append({"name": name, "description": description})
+        save_routine(user_id, routine)
+    except psycopg.Error:
+        logging.exception("Failed to save a new activity for user %s", user_id)
+        context.user_data.pop("new_activity_name", None)
+        await update.message.reply_text(
+            "I couldn't save the activity because the database is unavailable. Please try again later.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return ConversationHandler.END
+
+    context.user_data.pop("new_activity_name", None)
     await update.message.reply_text("Activity added.\n\n" + format_routine(routine), reply_markup=MAIN_KEYBOARD)
-    
     return ConversationHandler.END
+
+
+async def receive_activity_description(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Save the new activity with the description provided by the user."""
+    return await complete_add_activity(update, context, update.message.text.strip())
+
+
+async def skip_activity_description(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Save the new activity without a description."""
+    return await complete_add_activity(update, context, "")
 
 async def begin_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Show the routine and ask which activity the user wants to delete."""
@@ -410,7 +437,10 @@ def main() -> None:
             ],
             states={
                 ADD_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_activity_name)],
-                ADD_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_activity_description)],
+                ADD_DESCRIPTION: [
+                    CommandHandler("skip", skip_activity_description),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, receive_activity_description),
+                ],
                 DELETE_ACTIVITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_activity)],
                 REORDER_ACTIVITIES: [MessageHandler(filters.TEXT & ~filters.COMMAND, reorder_activities)],
                 SET_CURRENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_current)],
