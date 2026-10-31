@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import psycopg
@@ -127,6 +128,16 @@ def save_routine(user_id: int, routine: dict) -> None:
             ],
         )
 
+
+async def get_routine_async(user_id: int) -> dict:
+    """Load a routine without blocking the Telegram event loop."""
+    return await asyncio.to_thread(get_routine, user_id)
+
+
+async def save_routine_async(user_id: int, routine: dict) -> None:
+    """Save a routine without blocking the Telegram event loop."""
+    await asyncio.to_thread(save_routine, user_id, routine)
+
 def format_routine(routine: dict) -> str:
     """Format a routine as a readable list and mark its current activity."""
 
@@ -147,7 +158,7 @@ def format_routine(routine: dict) -> str:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Welcome the user and show their routine with the main menu."""
 
-    routine = get_routine(update.effective_user.id)
+    routine = await get_routine_async(update.effective_user.id)
 
     await update.message.reply_text(
         "Welcome! Create and manage your personal activity routine using the menu below.\n\n"
@@ -159,13 +170,13 @@ async def show_routine(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     """Display the user's current routine."""
 
     await update.message.reply_text(
-        format_routine(get_routine(update.effective_user.id)), reply_markup=MAIN_KEYBOARD
+        format_routine(await get_routine_async(update.effective_user.id)), reply_markup=MAIN_KEYBOARD
     )
 
 async def begin_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Start adding an activity if the routine has fewer than ten."""
 
-    routine = get_routine(update.effective_user.id)
+    routine = await get_routine_async(update.effective_user.id)
 
     if len(routine["activities"]) >= MAX_ACTIVITIES:
         await update.message.reply_text(
@@ -209,7 +220,8 @@ async def complete_add_activity(
         return ConversationHandler.END
 
     try:
-        routine = get_routine(user_id)
+        logging.info("Loading routine to add an activity for user %s", user_id)
+        routine = await get_routine_async(user_id)
         if len(routine["activities"]) >= MAX_ACTIVITIES:
             context.user_data.pop("new_activity_name", None)
             await update.message.reply_text(
@@ -219,7 +231,9 @@ async def complete_add_activity(
             return ConversationHandler.END
 
         routine["activities"].append({"name": name, "description": description})
-        save_routine(user_id, routine)
+        logging.info("Saving new activity for user %s", user_id)
+        await save_routine_async(user_id, routine)
+        logging.info("Saved new activity for user %s", user_id)
     except psycopg.Error:
         logging.exception("Failed to save a new activity for user %s", user_id)
         context.user_data.pop("new_activity_name", None)
@@ -241,12 +255,13 @@ async def receive_activity_description(update: Update, context: ContextTypes.DEF
 
 async def skip_activity_description(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Save the new activity without a description."""
+    logging.info("Received /skip command for user %s", update.effective_user.id)
     return await complete_add_activity(update, context, "")
 
 async def begin_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Show the routine and ask which activity the user wants to delete."""
 
-    routine = get_routine(update.effective_user.id)
+    routine = await get_routine_async(update.effective_user.id)
 
     if not routine["activities"]:
         await update.message.reply_text("Your routine is empty.", reply_markup=MAIN_KEYBOARD)
@@ -261,7 +276,7 @@ async def begin_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 async def delete_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Delete the selected activity and adjust the current index."""
 
-    routine = get_routine(update.effective_user.id)
+    routine = await get_routine_async(update.effective_user.id)
 
     try:
         position = int(update.message.text.strip()) - 1
@@ -285,7 +300,7 @@ async def delete_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif position == routine["current_index"]:
         routine["current_index"] %= len(routine["activities"])
 
-    save_routine(update.effective_user.id, routine)
+    await save_routine_async(update.effective_user.id, routine)
 
     await update.message.reply_text(
         f"Deleted: {removed['name']}\n\n{format_routine(routine)}", reply_markup=MAIN_KEYBOARD
@@ -297,7 +312,7 @@ async def delete_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def begin_reorder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Show the routine and ask for the desired activity order."""
 
-    routine = get_routine(update.effective_user.id)
+    routine = await get_routine_async(update.effective_user.id)
     count = len(routine["activities"])
 
     if count < 2:
@@ -317,7 +332,7 @@ async def begin_reorder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 async def reorder_activities(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Validate and save the user's new activity order."""
 
-    routine = get_routine(update.effective_user.id)
+    routine = await get_routine_async(update.effective_user.id)
 
     try:
         order = [int(value) - 1 for value in update.message.text.split()]
@@ -338,7 +353,7 @@ async def reorder_activities(update: Update, context: ContextTypes.DEFAULT_TYPE)
     routine["activities"] = [old_activities[index] for index in order]
     routine["current_index"] = order.index(old_current_index)
 
-    save_routine(update.effective_user.id, routine)
+    await save_routine_async(update.effective_user.id, routine)
     await update.message.reply_text("Routine reordered.\n\n" + format_routine(routine), reply_markup=MAIN_KEYBOARD)
     
     return ConversationHandler.END
@@ -346,7 +361,7 @@ async def reorder_activities(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def begin_set_current(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Show the routine and ask which activity should become current."""
 
-    routine = get_routine(update.effective_user.id)
+    routine = await get_routine_async(update.effective_user.id)
 
     if not routine["activities"]:
         await update.message.reply_text("Your routine is empty.", reply_markup=MAIN_KEYBOARD)
@@ -361,7 +376,7 @@ async def begin_set_current(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 async def set_current(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Set the selected activity as the routine's current activity."""
 
-    routine = get_routine(update.effective_user.id)
+    routine = await get_routine_async(update.effective_user.id)
 
     try:
         position = int(update.message.text.strip()) - 1
@@ -375,7 +390,7 @@ async def set_current(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         return SET_CURRENT
     
     routine["current_index"] = position
-    save_routine(update.effective_user.id, routine)
+    await save_routine_async(update.effective_user.id, routine)
     activity = routine["activities"][position]
 
     await update.message.reply_text(
@@ -389,7 +404,7 @@ async def next_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     """Advance the user's routine to the next activity and save it."""
 
     user_id = update.effective_user.id
-    routine = get_routine(user_id)
+    routine = await get_routine_async(user_id)
     activities = routine["activities"]
 
     if not activities:
@@ -397,7 +412,7 @@ async def next_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     
     routine["current_index"] = (routine["current_index"] + 1) % len(activities)
-    save_routine(user_id, routine)
+    await save_routine_async(user_id, routine)
     current = activities[routine["current_index"]]
 
     await update.message.reply_text(
