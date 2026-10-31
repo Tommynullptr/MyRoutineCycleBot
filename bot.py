@@ -19,6 +19,7 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 DATABASE_URL = os.environ["DATABASE_URL"]
@@ -117,16 +118,17 @@ def save_routine(user_id: int, routine: dict) -> None:
             "DELETE FROM routine_activities WHERE telegram_user_id = %s", (user_id,)
         )
         
-        connection.executemany(
-            """
-            INSERT INTO routine_activities (telegram_user_id, position, name, description)
-            VALUES (%s, %s, %s, %s)
-            """,
-            [
-                (user_id, position, activity["name"], activity["description"])
-                for position, activity in enumerate(activities)
-            ],
-        )
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO routine_activities (telegram_user_id, position, name, description)
+                VALUES (%s, %s, %s, %s)
+                """,
+                [
+                    (user_id, position, activity["name"], activity["description"])
+                    for position, activity in enumerate(activities)
+                ],
+            )
 
 
 async def get_routine_async(user_id: int) -> dict:
