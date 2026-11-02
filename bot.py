@@ -1,7 +1,8 @@
 import asyncio
 import logging
 import os
-import psycopg
+
+from database import DatabaseError, get_routine, initialize_database, save_routine
 
 from telegram import ReplyKeyboardMarkup, Update
 from telegram.ext import (
@@ -14,6 +15,7 @@ from telegram.ext import (
 )
 
 
+
 # For debugging
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -22,12 +24,9 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-DATABASE_URL = os.environ["DATABASE_URL"]
 
 MAX_ACTIVITIES = 10
-
 ADD_NAME, ADD_DESCRIPTION, DELETE_ACTIVITY, REORDER_ACTIVITIES, SET_CURRENT = range(5)
-
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["Show routine", "Next activity"],
@@ -39,123 +38,6 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
 )
 
 
-def connect_database():
-    """Open a PostgreSQL connection with a bounded connection wait."""
-    return psycopg.connect(DATABASE_URL, connect_timeout=10)
-
-
-
-def initialize_database() -> None:
-    """Create the database tables used to store user routines and activities."""
-
-    with connect_database() as connection:
-
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS user_routines (
-                telegram_user_id BIGINT PRIMARY KEY,
-                current_index INTEGER NOT NULL DEFAULT 0 CHECK (current_index >= 0)
-            )
-            """
-        )
-
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS routine_activities (
-                telegram_user_id BIGINT NOT NULL REFERENCES user_routines(telegram_user_id) ON DELETE CASCADE,
-                position INTEGER NOT NULL CHECK (position >= 0 AND position < 10),
-                name TEXT NOT NULL,
-                description TEXT NOT NULL,
-                PRIMARY KEY (telegram_user_id, position)
-            )
-            """
-        )
-
-def get_routine(user_id: int) -> dict:
-    """Load one user's routine and activities in their saved order."""
-
-    with connect_database() as connection:
-
-        row = connection.execute(
-            "SELECT current_index FROM user_routines WHERE telegram_user_id = %s", (user_id,)
-        ).fetchone()
-
-        if row is None:
-            return {"activities": [], "current_index": 0}
-        
-        activity_rows = connection.execute(
-            """
-            SELECT name, description FROM routine_activities
-            WHERE telegram_user_id = %s ORDER BY position
-            """,
-            (user_id,),
-        ).fetchall()
-
-    activities = [{"name": name, "description": description} for name, description in activity_rows]
-    current_index = row[0] % len(activities) if activities else 0
-
-    return {"activities": activities, "current_index": current_index}
-
-def save_routine(user_id: int, routine: dict) -> None:
-    """Save one user's current index and replace their stored activities."""
-
-    activities = routine["activities"]
-    current_index = routine["current_index"] if activities else 0
-
-    with connect_database() as connection:
-
-        connection.execute(
-            """
-            INSERT INTO user_routines (telegram_user_id, current_index)
-            VALUES (%s, %s)
-            ON CONFLICT (telegram_user_id)
-            DO UPDATE SET current_index = EXCLUDED.current_index
-            """,
-            (user_id, current_index),
-        )
-
-        connection.execute(
-            "DELETE FROM routine_activities WHERE telegram_user_id = %s", (user_id,)
-        )
-        
-        with connection.cursor() as cursor:
-            cursor.executemany(
-                """
-                INSERT INTO routine_activities (telegram_user_id, position, name, description)
-                VALUES (%s, %s, %s, %s)
-                """,
-                [
-                    (user_id, position, activity["name"], activity["description"])
-                    for position, activity in enumerate(activities)
-                ],
-            )
-
-
-async def get_routine_async(user_id: int) -> dict:
-    """Load a routine without blocking the Telegram event loop."""
-    return await asyncio.to_thread(get_routine, user_id)
-
-
-async def save_routine_async(user_id: int, routine: dict) -> None:
-    """Save a routine without blocking the Telegram event loop."""
-    await asyncio.to_thread(save_routine, user_id, routine)
-
-def format_routine(routine: dict) -> str:
-    """Format a routine as a readable list and mark its current activity."""
-
-    activities = routine["activities"]
-
-    if not activities:
-        return "Your routine is empty. Add your first activity to get started."
-
-    lines = ["Your routine:"]
-
-    for index, activity in enumerate(activities):
-        marker = "▶️" if index == routine["current_index"] else "▫️"
-        description = f" — {activity['description']}" if activity["description"] else ""
-        lines.append(f"{marker} {index + 1}. {activity['name']}{description}")
-
-    return "\n".join(lines)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Welcome the user and show their routine with the main menu."""
@@ -166,13 +48,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Welcome! Create and manage your personal activity routine using the menu below.\n\n"
         + format_routine(routine),
         reply_markup=MAIN_KEYBOARD,
-    )
-
-async def show_routine(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Display the user's current routine."""
-
-    await update.message.reply_text(
-        format_routine(await get_routine_async(update.effective_user.id)), reply_markup=MAIN_KEYBOARD
     )
 
 async def begin_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -192,6 +67,95 @@ async def begin_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     return ADD_NAME
 
+async def begin_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Show the routine and ask which activity the user wants to delete."""
+
+    routine = await get_routine_async(update.effective_user.id)
+
+    if not routine["activities"]:
+        await update.message.reply_text("Your routine is empty.", reply_markup=MAIN_KEYBOARD)
+        return ConversationHandler.END
+    
+    await update.message.reply_text(
+        format_routine(routine) + "\n\nSend the number of the activity to delete, or /cancel."
+    )
+
+    return DELETE_ACTIVITY
+
+async def begin_reorder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Show the routine and ask for the desired activity order."""
+
+    routine = await get_routine_async(update.effective_user.id)
+    count = len(routine["activities"])
+
+    if count < 2:
+        await update.message.reply_text(
+            "Add at least two activities before reordering.", reply_markup=MAIN_KEYBOARD
+        )
+        return ConversationHandler.END
+    
+    await update.message.reply_text(
+        format_routine(routine)
+        + "\n\nSend the activity numbers in the new order, separated by spaces. "
+        + f"For example: {' '.join(str(number) for number in range(count, 0, -1))}. Send /cancel to stop."
+    )
+
+    return REORDER_ACTIVITIES
+
+async def begin_set_current(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Show the routine and ask which activity should become current."""
+
+    routine = await get_routine_async(update.effective_user.id)
+
+    if not routine["activities"]:
+        await update.message.reply_text("Your routine is empty.", reply_markup=MAIN_KEYBOARD)
+        return ConversationHandler.END
+        
+    await update.message.reply_text(
+        format_routine(routine) + "\n\nSend the number of the activity to start from, or /cancel."
+    )
+
+    return SET_CURRENT
+
+# -------------------------------------------------------------------------------------------------------------
+# Database helpers are synchronous and can block while waiting for Neon. Run
+# them in a worker thread so the async Telegram event loop can keep handling
+# other updates; this avoids blocking the bot but does not make queries faster.
+
+async def get_routine_async(user_id: int) -> dict:
+    """Load a routine without blocking the Telegram event loop."""
+    return await asyncio.to_thread(get_routine, user_id)
+
+async def save_routine_async(user_id: int, routine: dict) -> None:
+    """Save a routine without blocking the Telegram event loop."""
+    await asyncio.to_thread(save_routine, user_id, routine)
+
+# -------------------------------------------------------------------------------------------------------------
+
+def format_routine(routine: dict) -> str:
+    """Format a routine as a readable list and mark its current activity."""
+
+    activities = routine["activities"]
+
+    if not activities:
+        return "Your routine is empty. Add your first activity to get started."
+
+    lines = ["Your routine:"]
+
+    for index, activity in enumerate(activities):
+        marker = "▶️" if index == routine["current_index"] else "▫️"
+        description = f" — {activity['description']}" if activity["description"] else ""
+        lines.append(f"{marker} {index + 1}. {activity['name']}{description}")
+
+    return "\n".join(lines)
+
+async def show_routine(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Display the user's current routine."""
+
+    await update.message.reply_text(
+        format_routine(await get_routine_async(update.effective_user.id)), reply_markup=MAIN_KEYBOARD
+    )
+
 async def receive_activity_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Store the new activity's name and ask for its description."""
 
@@ -208,72 +172,68 @@ async def receive_activity_name(update: Update, context: ContextTypes.DEFAULT_TY
 
     return ADD_DESCRIPTION
 
-async def complete_add_activity(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, description: str
-) -> int:
+async def complete_add_activity(update: Update, context: ContextTypes.DEFAULT_TYPE, description: str) -> int:
     """Save the pending activity, allowing an empty description."""
     user_id = update.effective_user.id
     name = context.user_data.get("new_activity_name")
+
     if not name:
         await update.message.reply_text(
             "I couldn't find the activity name. Please start again with Add activity.",
-            reply_markup=MAIN_KEYBOARD,
+            reply_markup = MAIN_KEYBOARD,
         )
+
         return ConversationHandler.END
 
     try:
         logging.info("Loading routine to add an activity for user %s", user_id)
         routine = await get_routine_async(user_id)
+
         if len(routine["activities"]) >= MAX_ACTIVITIES:
             context.user_data.pop("new_activity_name", None)
+
             await update.message.reply_text(
                 f"Your routine already has {MAX_ACTIVITIES} activities. Delete one before adding another.",
-                reply_markup=MAIN_KEYBOARD,
+                reply_markup = MAIN_KEYBOARD,
             )
+
             return ConversationHandler.END
 
         routine["activities"].append({"name": name, "description": description})
         logging.info("Saving new activity for user %s", user_id)
+
         await save_routine_async(user_id, routine)
         logging.info("Saved new activity for user %s", user_id)
-    except psycopg.Error:
+
+    except DatabaseError:
         logging.exception("Failed to save a new activity for user %s", user_id)
         context.user_data.pop("new_activity_name", None)
+
         await update.message.reply_text(
             "I couldn't save the activity because the database is unavailable. Please try again later.",
-            reply_markup=MAIN_KEYBOARD,
+            reply_markup = MAIN_KEYBOARD,
         )
+
         return ConversationHandler.END
 
     context.user_data.pop("new_activity_name", None)
     await update.message.reply_text("Activity added.\n\n" + format_routine(routine), reply_markup=MAIN_KEYBOARD)
     return ConversationHandler.END
 
+# -------------------------------------------------------------------------------------------------------------
+# These handlers pass either the user's description or an empty string
+# to the shared activity-saving function.
 
 async def receive_activity_description(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Save the new activity with the description provided by the user."""
     return await complete_add_activity(update, context, update.message.text.strip())
-
 
 async def skip_activity_description(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Save the new activity without a description."""
     logging.info("Received /skip command for user %s", update.effective_user.id)
     return await complete_add_activity(update, context, "")
 
-async def begin_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Show the routine and ask which activity the user wants to delete."""
-
-    routine = await get_routine_async(update.effective_user.id)
-
-    if not routine["activities"]:
-        await update.message.reply_text("Your routine is empty.", reply_markup=MAIN_KEYBOARD)
-        return ConversationHandler.END
-    
-    await update.message.reply_text(
-        format_routine(routine) + "\n\nSend the number of the activity to delete, or /cancel."
-    )
-
-    return DELETE_ACTIVITY
+# -------------------------------------------------------------------------------------------------------------
 
 async def delete_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Delete the selected activity and adjust the current index."""
@@ -310,27 +270,6 @@ async def delete_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     return ConversationHandler.END
 
-
-async def begin_reorder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Show the routine and ask for the desired activity order."""
-
-    routine = await get_routine_async(update.effective_user.id)
-    count = len(routine["activities"])
-
-    if count < 2:
-        await update.message.reply_text(
-            "Add at least two activities before reordering.", reply_markup=MAIN_KEYBOARD
-        )
-        return ConversationHandler.END
-    
-    await update.message.reply_text(
-        format_routine(routine)
-        + "\n\nSend the activity numbers in the new order, separated by spaces. "
-        + f"For example: {' '.join(str(number) for number in range(count, 0, -1))}. Send /cancel to stop."
-    )
-
-    return REORDER_ACTIVITIES
-
 async def reorder_activities(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Validate and save the user's new activity order."""
 
@@ -359,21 +298,6 @@ async def reorder_activities(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text("Routine reordered.\n\n" + format_routine(routine), reply_markup=MAIN_KEYBOARD)
     
     return ConversationHandler.END
-
-async def begin_set_current(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Show the routine and ask which activity should become current."""
-
-    routine = await get_routine_async(update.effective_user.id)
-
-    if not routine["activities"]:
-        await update.message.reply_text("Your routine is empty.", reply_markup=MAIN_KEYBOARD)
-        return ConversationHandler.END
-        
-    await update.message.reply_text(
-        format_routine(routine) + "\n\nSend the number of the activity to start from, or /cancel."
-    )
-
-    return SET_CURRENT
 
 async def set_current(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Set the selected activity as the routine's current activity."""
@@ -462,7 +386,7 @@ def main() -> None:
                 REORDER_ACTIVITIES: [MessageHandler(filters.TEXT & ~filters.COMMAND, reorder_activities)],
                 SET_CURRENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_current)],
             },
-            fallbacks=[CommandHandler("cancel", cancel)],
+            fallbacks = [CommandHandler("cancel", cancel)],
             allow_reentry=True,
         )
     )
@@ -470,16 +394,18 @@ def main() -> None:
     app.add_handler(CommandHandler("next", next_activity))
     app.add_handler(MessageHandler(filters.Regex(r"^Show routine$"), show_routine))
     app.add_handler(MessageHandler(filters.Regex(r"^Next activity$"), next_activity))
+
     render_url = os.environ["RENDER_EXTERNAL_URL"].rstrip("/")
     webhook_secret = os.environ["WEBHOOK_SECRET"]
     webhook_path = "telegram-webhook"
 
+    """Start the bot as an application with a webhook"""
     app.run_webhook(
-        listen="0.0.0.0",
-        port=int(os.environ.get("PORT", "10000")),
-        url_path=webhook_path,
-        webhook_url=f"{render_url}/{webhook_path}",
-        secret_token=webhook_secret,
+        listen = "0.0.0.0",
+        port = int(os.environ.get("PORT", "10000")),
+        url_path = webhook_path,
+        webhook_url = f"{render_url}/{webhook_path}",
+        secret_token = webhook_secret,
     )
 
 
